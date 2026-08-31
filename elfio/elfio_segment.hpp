@@ -301,7 +301,19 @@ template <class T> class segment_impl : public segment
         }
 
         stream.seekg( ( *translator )[header_offset] );
-        stream.read( reinterpret_cast<char*>( &ph ), sizeof( ph ) );
+        T loaded_header{};
+        stream.read( reinterpret_cast<char*>( &loaded_header ),
+                     sizeof( loaded_header ) );
+        if ( stream.gcount() != sizeof( loaded_header ) ) {
+            ph   = {};
+            data = nullptr;
+            sections.clear();
+            is_offset_set = false;
+            is_loaded     = false;
+            pstream       = nullptr;
+            return false;
+        }
+        ph = loaded_header;
 
         is_offset_set = true;
 

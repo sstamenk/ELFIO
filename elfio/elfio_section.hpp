@@ -442,7 +442,22 @@ template <class T> class section_impl : public section
         }
 
         stream.seekg( ( *translator )[header_offset] );
-        stream.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+        T loaded_header{};
+        stream.read( reinterpret_cast<char*>( &loaded_header ),
+                     sizeof( loaded_header ) );
+        if ( stream.gcount() != sizeof( loaded_header ) ) {
+            header    = {};
+            data      = nullptr;
+            data_size = 0;
+            name.clear();
+            is_address_set = false;
+            is_loaded      = false;
+            can_be_loaded  = false;
+            pstream        = nullptr;
+            return false;
+        }
+        header        = loaded_header;
+        can_be_loaded = true;
 
         if ( !( is_lazy || is_loaded ) ) {
             bool ret = get_data();
