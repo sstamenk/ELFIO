@@ -65,6 +65,7 @@ add_executable(
     ELFIOTest.cpp
     ELFIOTest1.cpp
     ELFIOTest2.cpp
+    ELFIORelocationBoundsTest.cpp
     ARIOTest.cpp)
 
 target_link_libraries(
