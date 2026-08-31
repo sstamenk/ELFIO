@@ -23,6 +23,8 @@ THE SOFTWARE.
 #ifndef ELFIO_SYMBOLS_HPP
 #define ELFIO_SYMBOLS_HPP
 
+#include <cstring>
+
 namespace ELFIO {
 
 //------------------------------------------------------------------------------
@@ -379,6 +381,30 @@ template <class S> class symbol_section_accessor_template
     Elf_Half get_hash_table_index() const { return hash_section_index; }
 
     //------------------------------------------------------------------------------
+    // @brief Read and convert a value from the hash section
+    // @param byte_offset Byte offset of the value in the hash section
+    // @param value Converted value
+    // @return True if the complete value is inside the section, false otherwise
+    //------------------------------------------------------------------------------
+    template <class T>
+    bool read_hash_value( Elf_Xword byte_offset, T& value ) const
+    {
+        const char* data =
+            hash_section == nullptr ? nullptr : hash_section->get_data();
+        Elf_Xword data_size =
+            hash_section == nullptr ? 0 : hash_section->get_size();
+        if ( data == nullptr || byte_offset > data_size ||
+             sizeof( T ) > data_size - byte_offset ) {
+            return false;
+        }
+
+        T raw_value;
+        std::memcpy( &raw_value, data + byte_offset, sizeof( raw_value ) );
+        value = ( *elf_file.get_convertor() )( raw_value );
+        return true;
+    }
+
+    //------------------------------------------------------------------------------
     // @brief Lookup a symbol in the hash table
     // @param name Name of the symbol
     // @param value Value of the symbol
@@ -397,33 +423,52 @@ template <class S> class symbol_section_accessor_template
                       Elf_Half&          section_index,
                       unsigned char&     other ) const
     {
-        bool        ret       = false;
-        const auto& convertor = elf_file.get_convertor();
-
-        Elf_Word nbucket = *(const Elf_Word*)hash_section->get_data();
-        nbucket          = ( *convertor )( nbucket );
-        Elf_Word nchain =
-            *(const Elf_Word*)( hash_section->get_data() + sizeof( Elf_Word ) );
-        nchain       = ( *convertor )( nchain );
-        Elf_Word val = elf_hash( (const unsigned char*)name.c_str() );
-        Elf_Word y =
-            *(const Elf_Word*)( hash_section->get_data() +
-                                ( 2 + val % nbucket ) * sizeof( Elf_Word ) );
-        y = ( *convertor )( y );
-        std::string str;
-        get_symbol( y, str, value, size, bind, type, section_index, other );
-        while ( str != name && STN_UNDEF != y && y < nchain ) {
-            y = *(const Elf_Word*)( hash_section->get_data() +
-                                    ( 2 + nbucket + y ) * sizeof( Elf_Word ) );
-            y = ( *convertor )( y );
-            get_symbol( y, str, value, size, bind, type, section_index, other );
+        Elf_Word nbucket = 0;
+        Elf_Word nchain  = 0;
+        if ( !read_hash_value( 0, nbucket ) ||
+             !read_hash_value( sizeof( Elf_Word ), nchain ) || nbucket == 0 ) {
+            return false;
         }
 
-        if ( str == name ) {
-            ret = true;
+        Elf_Xword word_count = hash_section->get_size() / sizeof( Elf_Word );
+        if ( word_count < 2 || nbucket > word_count - 2 ||
+             nchain > word_count - 2 - nbucket || nchain > get_symbols_num() ) {
+            return false;
         }
 
-        return ret;
+        Elf_Word hash = elf_hash( (const unsigned char*)name.c_str() );
+        Elf_Word symbol;
+        if ( !read_hash_value(
+                 ( 2 + static_cast<Elf_Xword>( hash % nbucket ) ) *
+                     sizeof( Elf_Word ),
+                 symbol ) ) {
+            return false;
+        }
+
+        for ( Elf_Word steps = 0; symbol != STN_UNDEF && steps < nchain;
+              ++steps ) {
+            if ( symbol >= nchain ) {
+                return false;
+            }
+
+            std::string symbol_name;
+            if ( !get_symbol( symbol, symbol_name, value, size, bind, type,
+                              section_index, other ) ) {
+                return false;
+            }
+            if ( symbol_name == name ) {
+                return true;
+            }
+
+            if ( !read_hash_value(
+                     ( 2 + static_cast<Elf_Xword>( nbucket ) + symbol ) *
+                         sizeof( Elf_Word ),
+                     symbol ) ) {
+                return false;
+            }
+        }
+
+        return false;
     }
 
     //------------------------------------------------------------------------------
@@ -446,67 +491,96 @@ template <class S> class symbol_section_accessor_template
                           Elf_Half&          section_index,
                           unsigned char&     other ) const
     {
-        bool        ret       = false;
-        const auto& convertor = elf_file.get_convertor();
+        std::uint32_t nbuckets    = 0;
+        std::uint32_t symoffset   = 0;
+        std::uint32_t bloom_size  = 0;
+        std::uint32_t bloom_shift = 0;
+        if ( !read_hash_value( 0, nbuckets ) ||
+             !read_hash_value( sizeof( std::uint32_t ), symoffset ) ||
+             !read_hash_value( 2 * sizeof( std::uint32_t ), bloom_size ) ||
+             !read_hash_value( 3 * sizeof( std::uint32_t ), bloom_shift ) ||
+             nbuckets == 0 || bloom_size == 0 ||
+             bloom_shift >= 8 * sizeof( std::uint32_t ) ) {
+            return false;
+        }
 
-        std::uint32_t nbuckets =
-            *( (std::uint32_t*)hash_section->get_data() + 0 );
-        std::uint32_t symoffset =
-            *( (std::uint32_t*)hash_section->get_data() + 1 );
-        std::uint32_t bloom_size =
-            *( (std::uint32_t*)hash_section->get_data() + 2 );
-        std::uint32_t bloom_shift =
-            *( (std::uint32_t*)hash_section->get_data() + 3 );
-        nbuckets    = ( *convertor )( nbuckets );
-        symoffset   = ( *convertor )( symoffset );
-        bloom_size  = ( *convertor )( bloom_size );
-        bloom_shift = ( *convertor )( bloom_shift );
+        Elf_Xword hash_size   = hash_section->get_size();
+        Elf_Xword header_size = 4 * sizeof( std::uint32_t );
+        if ( hash_size < header_size ||
+             bloom_size > ( hash_size - header_size ) / sizeof( T ) ) {
+            return false;
+        }
 
-        auto* bloom_filter =
-            (T*)( hash_section->get_data() + 4 * sizeof( std::uint32_t ) );
+        Elf_Xword buckets_offset =
+            header_size + static_cast<Elf_Xword>( bloom_size ) * sizeof( T );
+        if ( nbuckets >
+             ( hash_size - buckets_offset ) / sizeof( std::uint32_t ) ) {
+            return false;
+        }
+
+        Elf_Xword chains_offset =
+            buckets_offset +
+            static_cast<Elf_Xword>( nbuckets ) * sizeof( std::uint32_t );
+        Elf_Xword chain_count =
+            ( hash_size - chains_offset ) / sizeof( std::uint32_t );
+        Elf_Xword symbol_count = get_symbols_num();
+        if ( symoffset > symbol_count ) {
+            return false;
+        }
 
         std::uint32_t hash = elf_gnu_hash( (const unsigned char*)name.c_str() );
         std::uint32_t bloom_index = ( hash / ( 8 * sizeof( T ) ) ) % bloom_size;
         T             bloom_bits =
             ( (T)1 << ( hash % ( 8 * sizeof( T ) ) ) ) |
             ( (T)1 << ( ( hash >> bloom_shift ) % ( 8 * sizeof( T ) ) ) );
-
-        if ( ( ( *convertor )( bloom_filter[bloom_index] ) & bloom_bits ) !=
-             bloom_bits )
-            return ret;
-
-        std::uint32_t bucket  = hash % nbuckets;
-        auto*         buckets = (std::uint32_t*)( hash_section->get_data() +
-                                          4 * sizeof( std::uint32_t ) +
-                                          bloom_size * sizeof( T ) );
-        auto*         chains  = (std::uint32_t*)( hash_section->get_data() +
-                                         4 * sizeof( std::uint32_t ) +
-                                         bloom_size * sizeof( T ) +
-                                         nbuckets * sizeof( std::uint32_t ) );
-
-        if ( ( *convertor )( buckets[bucket] ) >= symoffset ) {
-            std::uint32_t chain_index =
-                ( *convertor )( buckets[bucket] ) - symoffset;
-            std::uint32_t chain_hash = ( *convertor )( chains[chain_index] );
-            std::string   symname;
-
-            while ( true ) {
-                if ( ( chain_hash >> 1 ) == ( hash >> 1 ) &&
-                     get_symbol( chain_index + symoffset, symname, value, size,
-                                 bind, type, section_index, other ) &&
-                     ( name == symname ) ) {
-                    ret = true;
-                    break;
-                }
-
-                if ( chain_hash & 1 )
-                    break;
-
-                chain_hash = ( *convertor )( chains[++chain_index] );
-            }
+        T bloom_value = 0;
+        if ( !read_hash_value( header_size +
+                                   static_cast<Elf_Xword>( bloom_index ) *
+                                       sizeof( T ),
+                               bloom_value ) ||
+             ( bloom_value & bloom_bits ) != bloom_bits ) {
+            return false;
         }
 
-        return ret;
+        std::uint32_t bucket = hash % nbuckets;
+        std::uint32_t symbol = 0;
+        if ( !read_hash_value( buckets_offset +
+                                   static_cast<Elf_Xword>( bucket ) *
+                                       sizeof( std::uint32_t ),
+                               symbol ) ||
+             symbol < symoffset ) {
+            return false;
+        }
+
+        Elf_Xword chain_index = symbol - symoffset;
+        while ( chain_index < chain_count ) {
+            if ( chain_index >= symbol_count - symoffset ) {
+                return false;
+            }
+
+            std::uint32_t chain_hash = 0;
+            if ( !read_hash_value( chains_offset +
+                                       chain_index * sizeof( std::uint32_t ),
+                                   chain_hash ) ) {
+                return false;
+            }
+
+            std::string symbol_name;
+            if ( ( chain_hash >> 1 ) == ( hash >> 1 ) &&
+                 get_symbol( static_cast<Elf_Xword>( symoffset ) + chain_index,
+                             symbol_name, value, size, bind, type,
+                             section_index, other ) &&
+                 name == symbol_name ) {
+                return true;
+            }
+
+            if ( chain_hash & 1 ) {
+                return false;
+            }
+            ++chain_index;
+        }
+
+        return false;
     }
 
     //------------------------------------------------------------------------------
