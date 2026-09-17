@@ -23,6 +23,7 @@ THE SOFTWARE.
 #include <cstdint>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <elfio/elfio.hpp>
@@ -44,11 +45,12 @@ class symbol_lookup_fixture
   public:
     symbol_lookup_fixture( unsigned char file_class,
                            unsigned char encoding,
-                           Elf_Word      hash_type )
+                           Elf_Word      hash_type,
+                           bool          local_first = false )
     {
         file.create( file_class, encoding );
 
-        section* strings = file.sections.add( ".strtab.test" );
+        strings = file.sections.add( ".strtab.test" );
         strings->set_type( SHT_STRTAB );
         const char string_data[] = { '\0', 'f', 'o', 'o', '\0' };
         strings->set_data( string_data, sizeof( string_data ) );
@@ -58,8 +60,8 @@ class symbol_lookup_fixture
         symbols->set_entry_size( file.get_default_entry_size( SHT_SYMTAB ) );
         symbols->set_link( strings->get_index() );
         symbol_section_accessor symbol_writer( file, symbols );
-        symbol_writer.add_symbol( 1, 0, 0, STB_GLOBAL, STT_NOTYPE, 0,
-                                  SHN_UNDEF );
+        symbol_writer.add_symbol( 1, 0, 0, local_first ? STB_LOCAL : STB_GLOBAL,
+                                  STT_NOTYPE, 0, SHN_UNDEF );
 
         hash = file.sections.add( ".hash.test" );
         hash->set_type( hash_type );
@@ -77,33 +79,56 @@ class symbol_lookup_fixture
 
     void set_valid_gnu_hash( const std::string& name, bool terminated )
     {
+        set_gnu_chain( { name.c_str() }, 1, terminated );
+    }
+
+    Elf_Word add_symbol( const char* name, Elf64_Addr value )
+    {
+        string_section_accessor names( strings );
+        symbol_section_accessor writer( file, symbols );
+        return writer.add_symbol( names, name, value, 0, STB_GLOBAL, STT_NOTYPE,
+                                  0, SHN_UNDEF );
+    }
+
+    void set_gnu_chain( std::initializer_list<const char*> names,
+                        std::uint32_t                      symbol_offset,
+                        bool                               terminated = true )
+    {
         constexpr std::uint32_t bloom_shift = 5;
-        std::uint32_t           hash_value =
-            elf_gnu_hash( (const unsigned char*)name.c_str() );
+        const unsigned word_bits = file.get_class() == ELFCLASS32 ? 32 : 64;
+        std::uint64_t  bloom     = 0;
+        std::vector<std::uint32_t> hashes;
+        for ( const char* name : names ) {
+            const std::uint32_t hash =
+                elf_gnu_hash( reinterpret_cast<const unsigned char*>( name ) );
+            hashes.push_back( hash );
+            bloom |= ( std::uint64_t{ 1 } << ( hash % word_bits ) ) |
+                     ( std::uint64_t{ 1 }
+                       << ( ( hash >> bloom_shift ) % word_bits ) );
+        }
         std::string data;
         append_value<std::uint32_t>( data, file, 1 );
-        append_value<std::uint32_t>( data, file, 1 );
+        append_value<std::uint32_t>( data, file, symbol_offset );
         append_value<std::uint32_t>( data, file, 1 );
         append_value<std::uint32_t>( data, file, bloom_shift );
         if ( file.get_class() == ELFCLASS32 ) {
-            std::uint32_t bloom =
-                ( (std::uint32_t)1 << ( hash_value % 32 ) ) |
-                ( (std::uint32_t)1 << ( ( hash_value >> bloom_shift ) % 32 ) );
-            append_value( data, file, bloom );
+            append_value( data, file, static_cast<std::uint32_t>( bloom ) );
         }
         else {
-            std::uint64_t bloom =
-                ( (std::uint64_t)1 << ( hash_value % 64 ) ) |
-                ( (std::uint64_t)1 << ( ( hash_value >> bloom_shift ) % 64 ) );
             append_value( data, file, bloom );
         }
-        append_value<std::uint32_t>( data, file, 1 );
-        append_value<std::uint32_t>(
-            data, file, terminated ? hash_value | 1U : hash_value & ~1U );
+        append_value( data, file, symbol_offset );
+        for ( size_t i = 0; i < hashes.size(); ++i ) {
+            const std::uint32_t chain_hash =
+                terminated && i + 1 == hashes.size() ? hashes[i] | 1U
+                                                     : hashes[i] & ~1U;
+            append_value( data, file, chain_hash );
+        }
         hash->set_data( data );
     }
 
-    bool find( const std::string& name ) const
+    bool find( const std::string& name,
+               Elf64_Addr*        found_value = nullptr ) const
     {
         const_symbol_section_accessor reader( file, symbols );
         Elf64_Addr                    value         = 0;
@@ -112,13 +137,18 @@ class symbol_lookup_fixture
         unsigned char                 type          = 0;
         Elf_Half                      section_index = 0;
         unsigned char                 other         = 0;
-        return reader.get_symbol( name, value, size, bind, type, section_index,
-                                  other );
+        const bool found = reader.get_symbol( name, value, size, bind, type,
+                                              section_index, other );
+        if ( found_value != nullptr ) {
+            *found_value = value;
+        }
+        return found;
     }
 
   private:
     elfio    file;
     section* symbols = nullptr;
+    section* strings = nullptr;
     section* hash    = nullptr;
 };
 
@@ -191,6 +221,38 @@ TEST( ELFIOHashBoundsTest, PreservesValidGnuHashLookups )
             fixture.set_valid_gnu_hash( "foo", true );
             EXPECT_TRUE( fixture.find( "foo" ) );
             EXPECT_FALSE( fixture.find( "missing" ) );
+        }
+    }
+}
+
+TEST( ELFIOHashBoundsTest, TraversesHashChainsBeforeLinearFallback )
+{
+    for ( unsigned char file_class : { ELFCLASS32, ELFCLASS64 } ) {
+        for ( unsigned char encoding : { ELFDATA2LSB, ELFDATA2MSB } ) {
+            for ( Elf_Word hash_type : { SHT_HASH, SHT_GNU_HASH } ) {
+                SCOPED_TRACE( ::testing::Message()
+                              << "class=" << int( file_class ) << " encoding="
+                              << int( encoding ) << " hash=" << hash_type );
+                symbol_lookup_fixture fixture( file_class, encoding, hash_type,
+                                               true );
+                ASSERT_EQ( fixture.add_symbol( "bar", 17 ), 2U );
+                ASSERT_EQ( fixture.add_symbol( "foo", 42 ), 3U );
+                if ( hash_type == SHT_HASH ) {
+                    fixture.set_words( { 1, 4, 2, 0, 0, 3, 0 } );
+                }
+                else {
+                    fixture.set_gnu_chain( { "bar", "foo" }, 2 );
+                }
+
+                // The chain is bar -> global foo. A broken hash lookup would
+                // fall back to the earlier local foo, whose value is zero.
+                Elf64_Addr value = 0;
+                ASSERT_TRUE( fixture.find( "foo", &value ) );
+                EXPECT_EQ( value, 42U );
+                ASSERT_TRUE( fixture.find( "bar", &value ) );
+                EXPECT_EQ( value, 17U );
+                EXPECT_FALSE( fixture.find( "missing" ) );
+            }
         }
     }
 }

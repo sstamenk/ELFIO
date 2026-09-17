@@ -389,10 +389,11 @@ template <class S> class symbol_section_accessor_template
     template <class T>
     bool read_hash_value( Elf_Xword byte_offset, T& value ) const
     {
-        const char* data =
-            hash_section == nullptr ? nullptr : hash_section->get_data();
-        Elf_Xword data_size =
-            hash_section == nullptr ? 0 : hash_section->get_size();
+        if ( hash_section == nullptr ) {
+            return false;
+        }
+        const char*     data      = hash_section->get_data();
+        const Elf_Xword data_size = hash_section->get_size();
         if ( data == nullptr || byte_offset > data_size ||
              sizeof( T ) > data_size - byte_offset ) {
             return false;
@@ -430,13 +431,15 @@ template <class S> class symbol_section_accessor_template
             return false;
         }
 
-        Elf_Xword word_count = hash_section->get_size() / sizeof( Elf_Word );
+        const Elf_Xword word_count =
+            hash_section->get_size() / sizeof( Elf_Word );
         if ( word_count < 2 || nbucket > word_count - 2 ||
              nchain > word_count - 2 - nbucket || nchain > get_symbols_num() ) {
             return false;
         }
 
-        Elf_Word hash = elf_hash( (const unsigned char*)name.c_str() );
+        const Elf_Word hash =
+            elf_hash( reinterpret_cast<const unsigned char*>( name.c_str() ) );
         Elf_Word symbol;
         if ( !read_hash_value(
                  ( 2 + static_cast<Elf_Xword>( hash % nbucket ) ) *
@@ -504,35 +507,38 @@ template <class S> class symbol_section_accessor_template
             return false;
         }
 
-        Elf_Xword hash_size   = hash_section->get_size();
-        Elf_Xword header_size = 4 * sizeof( std::uint32_t );
+        const Elf_Xword     hash_size   = hash_section->get_size();
+        constexpr Elf_Xword header_size = 4 * sizeof( std::uint32_t );
         if ( hash_size < header_size ||
              bloom_size > ( hash_size - header_size ) / sizeof( T ) ) {
             return false;
         }
 
-        Elf_Xword buckets_offset =
+        const Elf_Xword buckets_offset =
             header_size + static_cast<Elf_Xword>( bloom_size ) * sizeof( T );
         if ( nbuckets >
              ( hash_size - buckets_offset ) / sizeof( std::uint32_t ) ) {
             return false;
         }
 
-        Elf_Xword chains_offset =
+        const Elf_Xword chains_offset =
             buckets_offset +
             static_cast<Elf_Xword>( nbuckets ) * sizeof( std::uint32_t );
-        Elf_Xword chain_count =
+        const Elf_Xword chain_count =
             ( hash_size - chains_offset ) / sizeof( std::uint32_t );
-        Elf_Xword symbol_count = get_symbols_num();
+        const Elf_Xword symbol_count = get_symbols_num();
         if ( symoffset > symbol_count ) {
             return false;
         }
 
-        std::uint32_t hash = elf_gnu_hash( (const unsigned char*)name.c_str() );
-        std::uint32_t bloom_index = ( hash / ( 8 * sizeof( T ) ) ) % bloom_size;
-        T             bloom_bits =
-            ( (T)1 << ( hash % ( 8 * sizeof( T ) ) ) ) |
-            ( (T)1 << ( ( hash >> bloom_shift ) % ( 8 * sizeof( T ) ) ) );
+        const std::uint32_t hash = elf_gnu_hash(
+            reinterpret_cast<const unsigned char*>( name.c_str() ) );
+        constexpr unsigned  bloom_word_bits = 8 * sizeof( T );
+        const std::uint32_t bloom_index =
+            ( hash / bloom_word_bits ) % bloom_size;
+        const T bloom_bits =
+            ( T{ 1 } << ( hash % bloom_word_bits ) ) |
+            ( T{ 1 } << ( ( hash >> bloom_shift ) % bloom_word_bits ) );
         T bloom_value = 0;
         if ( !read_hash_value( header_size +
                                    static_cast<Elf_Xword>( bloom_index ) *
@@ -542,8 +548,8 @@ template <class S> class symbol_section_accessor_template
             return false;
         }
 
-        std::uint32_t bucket = hash % nbuckets;
-        std::uint32_t symbol = 0;
+        const std::uint32_t bucket = hash % nbuckets;
+        std::uint32_t       symbol = 0;
         if ( !read_hash_value( buckets_offset +
                                    static_cast<Elf_Xword>( bucket ) *
                                        sizeof( std::uint32_t ),
